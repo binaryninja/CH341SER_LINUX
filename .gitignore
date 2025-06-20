@@ -138,3 +138,11 @@ Thumbs.db
 deployment_success.txt
 last_deployment.json
 esp_monitor_env/
+
+# Demo and test generated files
+demo_*.db
+demo_exports/
+demo_reports/
+*.db
+exports/
+reports/
