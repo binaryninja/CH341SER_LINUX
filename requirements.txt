@@ -1,0 +1,28 @@
+# Core dependencies for ESP Monitor with Database and Reporting Features
+# Install with: pip install -r requirements.txt
+
+# Serial communication
+pyserial>=3.5
+
+# Database and data handling
+sqlite3  # Usually built-in with Python
+pandas>=1.3.0
+
+# Visualization and reporting
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Report generation
+jinja2>=3.0.0
+
+# Optional: Enhanced PDF generation (uncomment if needed)
+# reportlab>=3.6.0
+# weasyprint>=56.0
+
+# Optional: Advanced time series database support (uncomment if needed)
+# influxdb-client>=1.24.0
+# psycopg2-binary>=2.9.0  # For PostgreSQL support
+
+# Development and testing (optional)
+# pytest>=6.0.0
+# pytest-cov>=2.12.0

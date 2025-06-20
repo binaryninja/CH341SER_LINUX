@@ -12,11 +12,16 @@ Features:
 - Remote command execution
 - Performance metrics
 - Web interface management
+- Historical data persistence with SQLite
+- Performance analytics and reporting
+- Anomaly detection and alerting
+- Data export capabilities
 
 Usage:
     python3 esp_monitor.py                    # Start monitoring
     python3 esp_monitor.py --command status   # Get device status
     python3 esp_monitor.py --web-interface    # Launch web management interface
+    python3 esp_monitor.py --generate-report  # Generate performance report
 """
 
 import serial
@@ -26,22 +31,37 @@ import argparse
 import threading
 import queue
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from collections import deque
 import http.server
 import socketserver
 from urllib.parse import parse_qs, urlparse
+import logging
+
+# Import our new modules
+try:
+    from database_manager import DatabaseManager, ConnectionEvent, DeviceStatus, PerformanceMetrics
+    from report_generator import ReportGenerator
+    DATABASE_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Database features not available: {e}")
+    print("Install required packages: pip install matplotlib seaborn pandas jinja2")
+    DATABASE_AVAILABLE = False
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class ESPMonitor:
-    def __init__(self, port: str = '/dev/ttyUSB0', baudrate: int = 115200):
+    def __init__(self, port: str = '/dev/ttyUSB0', baudrate: int = 115200, enable_database: bool = True):
         self.port = port
         self.baudrate = baudrate
         self.ser: Optional[serial.Serial] = None
         self.connected = False
         self.monitoring = False
 
-        # Data storage
+        # Data storage (legacy deques for backward compatibility)
         self.connection_log = deque(maxlen=1000)
         self.request_log = deque(maxlen=500)
         self.status_history = deque(maxlen=100)
@@ -52,6 +72,28 @@ class ESPMonitor:
             'uptime_start': None,
             'last_activity': None
         }
+
+        # Database integration
+        self.database_enabled = enable_database and DATABASE_AVAILABLE
+        self.db_manager = None
+        self.report_generator = None
+
+        if self.database_enabled:
+            try:
+                self.db_manager = DatabaseManager()
+                self.report_generator = ReportGenerator(self.db_manager)
+                logger.info("Database persistence enabled")
+            except Exception as e:
+                logger.error(f"Failed to initialize database: {e}")
+                self.database_enabled = False
+
+        # Performance tracking
+        self.last_metrics_update = datetime.now()
+        self.metrics_update_interval = 300  # 5 minutes
+
+        # Status tracking
+        self.last_status_update = datetime.now()
+        self.status_update_interval = 60  # 1 minute
 
         # Threading
         self.monitor_thread = None
@@ -217,6 +259,22 @@ class ESPMonitor:
 
         self.metrics['last_activity'] = event['timestamp']
 
+        # Store in database if enabled
+        if self.database_enabled and self.db_manager:
+            try:
+                connection_event = ConnectionEvent(
+                    timestamp=event['timestamp'],
+                    event_type=event['type'],
+                    connection_id=event['connection_id'],
+                    method=event.get('method'),
+                    path=event.get('path'),
+                    length=event.get('length'),
+                    raw_data=event.get('raw_data')
+                )
+                self.db_manager.store_connection_event(connection_event)
+            except Exception as e:
+                logger.warning(f"Failed to store event in database: {e}")
+
     def monitor_loop(self):
         """Main monitoring loop"""
         print("Starting ESP module monitoring...")
@@ -252,6 +310,19 @@ class ESPMonitor:
                             elif line and not line.startswith('AT'):
                                 # Log other interesting data
                                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {line}")
+
+                # Periodic database updates
+                now = datetime.now()
+
+                # Update device status periodically
+                if (now - self.last_status_update).total_seconds() >= self.status_update_interval:
+                    self._update_device_status()
+                    self.last_status_update = now
+
+                # Update performance metrics periodically
+                if (now - self.last_metrics_update).total_seconds() >= self.metrics_update_interval:
+                    self._update_performance_metrics()
+                    self.last_metrics_update = now
 
                 time.sleep(0.1)
 
@@ -376,6 +447,212 @@ class ESPMonitor:
         summary['connections_last_hour'] = len(recent_connections)
 
         return summary
+
+    def _update_device_status(self):
+        """Update device status in database"""
+        if not self.database_enabled or not self.db_manager:
+            return
+
+        try:
+            # Parse current device status
+            wifi_status = self.send_at_command("AT+CWJAP?")
+            ip_info = self.send_at_command("AT+CIFSR")
+
+            # Extract WiFi connection status
+            wifi_connected = "OK" in wifi_status and "No AP" not in wifi_status
+
+            # Extract IP address
+            ip_address = None
+            if ip_info:
+                ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', ip_info)
+                if ip_match:
+                    ip_address = ip_match.group(1)
+
+            # Create device status record
+            device_status = DeviceStatus(
+                timestamp=datetime.now(),
+                status='connected' if self.connected else 'disconnected',
+                wifi_connected=wifi_connected,
+                ip_address=ip_address,
+                uptime_seconds=int((datetime.now() - self.metrics['uptime_start']).total_seconds()) if self.metrics['uptime_start'] else None
+            )
+
+            self.db_manager.store_device_status(device_status)
+
+        except Exception as e:
+            logger.warning(f"Failed to update device status: {e}")
+
+    def _update_performance_metrics(self):
+        """Update performance metrics in database"""
+        if not self.database_enabled or not self.db_manager:
+            return
+
+        try:
+            # Calculate rates
+            uptime_hours = 0
+            if self.metrics['uptime_start']:
+                uptime_hours = (datetime.now() - self.metrics['uptime_start']).total_seconds() / 3600
+
+            connections_per_hour = self.metrics['connections_total'] / max(uptime_hours, 1)
+            requests_per_hour = self.metrics['requests_total'] / max(uptime_hours, 1)
+
+            # Create performance metrics record
+            performance_metrics = PerformanceMetrics(
+                timestamp=datetime.now(),
+                connections_total=self.metrics['connections_total'],
+                requests_total=self.metrics['requests_total'],
+                errors_total=self.metrics['errors_total'],
+                connections_per_hour=connections_per_hour,
+                requests_per_hour=requests_per_hour
+            )
+
+            self.db_manager.store_performance_metrics(performance_metrics)
+
+        except Exception as e:
+            logger.warning(f"Failed to update performance metrics: {e}")
+
+    def get_historical_data(self, data_type: str, hours: int = 24) -> List[Dict]:
+        """Get historical data from database"""
+        if not self.database_enabled or not self.db_manager:
+            return []
+
+        start_time = datetime.now() - timedelta(hours=hours)
+
+        try:
+            if data_type == 'connections':
+                return self.db_manager.get_connection_events(start_time=start_time)
+            elif data_type == 'status':
+                return self.db_manager.get_device_status_history(start_time=start_time)
+            elif data_type == 'metrics':
+                return self.db_manager.get_performance_metrics_history(start_time=start_time)
+            else:
+                return []
+        except Exception as e:
+            logger.error(f"Failed to get historical data: {e}")
+            return []
+
+    def generate_report(self, report_type: str = 'html', hours: int = 24) -> str:
+        """Generate performance report"""
+        if not self.database_enabled or not self.report_generator:
+            print("Database features not available. Cannot generate report.")
+            return ""
+
+        start_time = datetime.now() - timedelta(hours=hours)
+        end_time = datetime.now()
+
+        try:
+            if report_type.lower() == 'html':
+                filename = f"esp_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+                return self.report_generator.generate_html_report(start_time, end_time, filename)
+            elif report_type.lower() == 'pdf':
+                filename = f"esp_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                return self.report_generator.generate_pdf_report(start_time, end_time, filename)
+            else:
+                return json.dumps(self.report_generator.generate_summary_report(start_time, end_time), indent=2)
+        except Exception as e:
+            logger.error(f"Failed to generate report: {e}")
+            return ""
+
+    def export_data(self, format_type: str = 'csv', hours: int = 24) -> Dict[str, str]:
+        """Export monitoring data"""
+        if not self.database_enabled or not self.db_manager:
+            print("Database features not available. Cannot export data.")
+            return {}
+
+        start_time = datetime.now() - timedelta(hours=hours)
+        end_time = datetime.now()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        try:
+            exported_files = {}
+
+            if format_type.lower() == 'csv':
+                # Export connection events
+                filename = f"connection_events_{timestamp}.csv"
+                self.db_manager.export_to_csv("connection_events", filename, start_time, end_time)
+                exported_files['connection_events'] = filename
+
+                # Export device status
+                filename = f"device_status_{timestamp}.csv"
+                self.db_manager.export_to_csv("device_status", filename, start_time, end_time)
+                exported_files['device_status'] = filename
+
+                # Export performance metrics
+                filename = f"performance_metrics_{timestamp}.csv"
+                self.db_manager.export_to_csv("performance_metrics", filename, start_time, end_time)
+                exported_files['performance_metrics'] = filename
+
+            elif format_type.lower() == 'json':
+                # Export connection events
+                filename = f"connection_events_{timestamp}.json"
+                self.db_manager.export_to_json("connection_events", filename, start_time, end_time)
+                exported_files['connection_events'] = filename
+
+            return exported_files
+
+        except Exception as e:
+            logger.error(f"Failed to export data: {e}")
+            return {}
+
+    def detect_anomalies(self) -> List[Dict]:
+        """Detect performance anomalies"""
+        if not self.database_enabled or not self.db_manager:
+            return []
+
+        try:
+            return self.db_manager.detect_anomalies()
+        except Exception as e:
+            logger.error(f"Failed to detect anomalies: {e}")
+            return []
+
+    def cleanup_old_data(self, retention_days: int = 30):
+        """Clean up old data based on retention policy"""
+        if not self.database_enabled or not self.db_manager:
+            return
+
+        try:
+            self.db_manager.cleanup_old_data(retention_days)
+            print(f"Cleaned up data older than {retention_days} days")
+        except Exception as e:
+            logger.error(f"Failed to cleanup old data: {e}")
+
+    def update_baselines(self):
+        """Update performance baselines for anomaly detection"""
+        if not self.database_enabled or not self.db_manager:
+            return
+
+        try:
+            self.db_manager.update_performance_baselines()
+            print("Performance baselines updated")
+        except Exception as e:
+            logger.error(f"Failed to update baselines: {e}")
+
+    def get_statistics(self, hours: int = 24) -> Dict:
+        """Get comprehensive statistics"""
+        if not self.database_enabled or not self.db_manager:
+            return self.get_metrics_summary()
+
+        start_time = datetime.now() - timedelta(hours=hours)
+
+        try:
+            return self.db_manager.get_statistics(start_time)
+        except Exception as e:
+            logger.error(f"Failed to get statistics: {e}")
+            return self.get_metrics_summary()
+
+    def close(self):
+        """Clean shutdown of monitor"""
+        self.stop_monitoring()
+        self.disconnect()
+
+        if self.database_enabled and self.db_manager:
+            self.db_manager.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 class WebManagementServer:
     """Web interface for ESP monitoring"""
@@ -602,14 +879,96 @@ def main():
     parser.add_argument('--reset', action='store_true', help='Reset ESP device')
     parser.add_argument('--web-interface', action='store_true', help='Start web management interface')
     parser.add_argument('--web-port', type=int, default=8080, help='Web interface port')
+    parser.add_argument('--no-database', action='store_true', help='Disable database features')
+
+    # New database and reporting arguments
+    parser.add_argument('--generate-report', choices=['html', 'pdf', 'json'], help='Generate performance report')
+    parser.add_argument('--report-hours', type=int, default=24, help='Hours of data to include in report')
+    parser.add_argument('--export-data', choices=['csv', 'json'], help='Export monitoring data')
+    parser.add_argument('--cleanup-data', type=int, metavar='DAYS', help='Clean up data older than specified days')
+    parser.add_argument('--update-baselines', action='store_true', help='Update performance baselines')
+    parser.add_argument('--detect-anomalies', action='store_true', help='Detect and display anomalies')
+    parser.add_argument('--statistics', action='store_true', help='Show comprehensive statistics')
+    parser.add_argument('--stats-hours', type=int, default=24, help='Hours of data for statistics')
 
     args = parser.parse_args()
 
-    # Create monitor
-    monitor = ESPMonitor(args.port, args.baudrate)
+    # Create monitor with database option
+    enable_database = not args.no_database
+    monitor = ESPMonitor(args.port, args.baudrate, enable_database=enable_database)
 
     try:
-        # Connect to device
+        # Handle database-only operations (don't require device connection)
+        if args.generate_report:
+            if not monitor.database_enabled:
+                print("Database features not available. Cannot generate report.")
+                return 1
+
+            print(f"Generating {args.generate_report} report for last {args.report_hours} hours...")
+            report_file = monitor.generate_report(args.generate_report, args.report_hours)
+            if report_file:
+                print(f"Report generated: {report_file}")
+                return 0
+            else:
+                print("Failed to generate report")
+                return 1
+
+        if args.export_data:
+            if not monitor.database_enabled:
+                print("Database features not available. Cannot export data.")
+                return 1
+
+            print(f"Exporting data in {args.export_data} format...")
+            exported_files = monitor.export_data(args.export_data, args.report_hours)
+            if exported_files:
+                print("Data exported to:")
+                for table, filename in exported_files.items():
+                    print(f"  {table}: {filename}")
+                return 0
+            else:
+                print("Failed to export data")
+                return 1
+
+        if args.cleanup_data:
+            if not monitor.database_enabled:
+                print("Database features not available. Cannot cleanup data.")
+                return 1
+
+            monitor.cleanup_old_data(args.cleanup_data)
+            return 0
+
+        if args.update_baselines:
+            if not monitor.database_enabled:
+                print("Database features not available. Cannot update baselines.")
+                return 1
+
+            monitor.update_baselines()
+            return 0
+
+        if args.detect_anomalies:
+            if not monitor.database_enabled:
+                print("Database features not available. Cannot detect anomalies.")
+                return 1
+
+            anomalies = monitor.detect_anomalies()
+            if anomalies:
+                print(f"\n🚨 Found {len(anomalies)} anomalies:")
+                for anomaly in anomalies:
+                    print(f"  - {anomaly['metric_name']}: {anomaly['current_value']:.2f} "
+                          f"(baseline: {anomaly['baseline_value']:.2f}, "
+                          f"deviation: {anomaly['deviation']:.2f}, "
+                          f"severity: {anomaly['severity']})")
+            else:
+                print("✅ No anomalies detected")
+            return 0
+
+        if args.statistics:
+            stats = monitor.get_statistics(args.stats_hours)
+            print(f"\n📊 Statistics for last {args.stats_hours} hours:")
+            print(json.dumps(stats, indent=2, default=str))
+            return 0
+
+        # Connect to device for operations that require it
         if not monitor.connect():
             print("Failed to connect to ESP module")
             return 1
@@ -640,29 +999,35 @@ def main():
             # Start monitoring in background
             monitor.start_monitoring()
 
-            # Start web interface
+            # Start web server
             web_server = WebManagementServer(monitor, args.web_port)
-            web_server.start_server()
+            try:
+                web_server.start_server()
+            except KeyboardInterrupt:
+                print("\nStopping web server...")
+            return 0
 
         else:
-            # Default: start monitoring
+            # Default: start interactive monitoring
             monitor.start_monitoring()
 
             try:
                 while True:
                     time.sleep(1)
             except KeyboardInterrupt:
-                print("\nStopping monitor...")
+                print("\nStopping monitoring...")
+                return 0
 
     except KeyboardInterrupt:
         print("\nInterrupted by user")
+        return 0
     except Exception as e:
         print(f"Error: {e}")
         return 1
     finally:
-        monitor.disconnect()
-
-    return 0
+        # Clean shutdown
+        monitor.close()
 
 if __name__ == "__main__":
-    exit(main())
+    import sys
+    sys.exit(main())
